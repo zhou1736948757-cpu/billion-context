@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ExternalSummaryExecutor, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
+import { ExternalSummaryExecutor, summaryAbortSource, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
 
 const work: SummaryWork = { content: "Historical task evidence", instructions: "Preserve constraints and unfinished work", reference: "Read-only current task" };
 const budget: SummaryBudget = { totalTimeoutMs: 2000, targetTimeoutMs: 500, maxSummaryBytes: 200 };
@@ -199,22 +199,55 @@ test("external summary: late rejections are observed and release capacity", asyn
     assert.equal((await executor.execute(work, [successful()], budget)).status, "success");
 });
 
-test("external summary: elapsed total deadlines reject success even before the timer can fire", async () => {
-    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+test("external summary: elapsed total deadlines reject success even before the timer can fire", async (t) => {
+    let elapsed = 0;
+    t.mock.method(performance, "now", () => elapsed);
+    let calls = 0;
+    let abortedBeforeReturn: boolean | undefined;
+    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => {
+        calls++;
+        elapsed = 20;
+        abortedBeforeReturn = signal.aborted;
         return "too late";
     } }], { ...budget, totalTimeoutMs: 5 });
+    assert.equal(calls, 1);
+    assert.equal(abortedBeforeReturn, false, "the timer has not fired before the late value is returned");
     assert.equal(result.status, "deadline");
     assert.equal("summary" in result, false);
 });
 
-test("external summary: elapsed target deadlines fail over before a delayed timer fires", async () => {
-    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+test("external summary: elapsed target deadlines fail over before a delayed timer fires", async (t) => {
+    // Advance only the first attempt: real 5ms budgets also expire healthy backups on loaded runners.
+    let elapsed = 0;
+    t.mock.method(performance, "now", () => elapsed);
+    let first: AbortSignal | undefined;
+    let firstAbortedBeforeReturn: boolean | undefined;
+    let backupAborted: boolean | undefined;
+    let backupCalls = 0;
+    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => {
+        first = signal;
+        elapsed = 20;
+        firstAbortedBeforeReturn = signal.aborted;
         return "too late";
-    } }, successful("backup")], { ...budget, targetTimeoutMs: 5 });
+    } }, { summarize: async (_request, signal) => {
+        backupCalls++;
+        backupAborted = signal.aborted;
+        return "  backup\n";
+    } }], { ...budget, targetTimeoutMs: 5 });
+    assert.equal(firstAbortedBeforeReturn, false, "the timer has not fired before the late value is returned");
+    assert.ok(first);
+    assert.equal(first.aborted, true);
+    assert.equal(summaryAbortSource(first), "target-timeout");
+    assert.equal(backupCalls, 1);
+    assert.equal(backupAborted, false);
     assert.equal(result.status, "success");
-    assert.deepEqual(result.attempts.map((item) => item.outcome), ["timeout", "success"]);
+    if (result.status !== "success") throw new Error("unreachable");
+    assert.equal(result.targetIndex, 1);
+    assert.equal(result.summary, "  backup\n");
+    assert.deepEqual(result.attempts, [
+        { targetIndex: 0, outcome: "timeout", detail: "target-timeout 5ms (elapsed 20ms)" },
+        { targetIndex: 1, outcome: "success" },
+    ]);
 });
 
 test("external summary: a caller cannot mutate the budget of an in-flight operation", async () => {
