@@ -166,18 +166,19 @@ async function clearRestartMarker(): Promise<void> {
 /** Stub replacement: serves real HTTP on argv[2] and stays up until killed.
  *  A bare TCP accept is not enough: the readiness probe passes but every
  *  request gets its socket closed before a response. */
-function makeReadyStub(name: string): string {
+function makeReadyStub(name: string, instanceId?: string): string {
     const p = path.join(root, name);
     writeFileSync(p, [
         "import http from 'node:http';",
         "const port = Number(process.argv[2]);",
+        `const instanceId = ${JSON.stringify(instanceId) ?? "undefined"};`,
         "if (!Number.isFinite(port)) process.exit(64);",
         // #3182: a stolen port must be distinguishable from a product
         // failure — exit 91 lets the retry wrapper below re-run the scenario.
         // EACCES/EPERM = the OS refused the bind outright (Windows dynamic
         // exclusion ranges on shared runners) — same "port unusable" class,
         // not a product failure.
-        "const srv = http.createServer((_req, res) => res.end('ok'));",
+        "const srv = http.createServer((req, res) => res.end(req.url === '/__bili/health' ? JSON.stringify({ ok: true, pid: process.pid, instanceId }) : 'ok'));",
         "srv.on('error', (e) => process.exit(e && ['EADDRINUSE', 'EACCES', 'EPERM'].includes(e.code) ? 91 : 1));",
         "srv.listen(port, '127.0.0.1');",
     ].join("\n"));
@@ -648,19 +649,23 @@ test("performSelfRestart: port taken over by another bili instance → parent ex
     const { log, entries } = makeLog();
     const record: SpawnRecord = {};
     let finished = 0;
-    // A live non-listening process standing in for a peer bili instance.
-    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+    let peer: ChildProcess | undefined;
     try {
-        assert.ok(sleeper.pid, "sleeper pid for the fake peer");
         // A live bili peer now owns our port (e.g. a host respawn that beat the
         // replacement): resuming THIS old-code copy would ladder-drift it onto
         // a fresh port nobody routes to — the zombie half of the leak.
-        writeRegistryEntry({ instanceId: "superseding-peer", pid: sleeper.pid, port, origin: `http://127.0.0.1:${port}`, startedAt: Date.now(), lane: "dsh" });
         const result = await performSelfRestart({
             server, host: "127.0.0.1", port,
             installDir: makeInstall("1.0.1"),
             runningVersion: "1.0.0", diskVersion: "1.0.1",
             log, inFlightProvider: () => 0,
+            preSpawnFlush: async () => {
+                peer = spawn(process.execPath, [makeReadyStub("peer.mjs", "superseding-peer"), String(port)], { stdio: "ignore" });
+                assert.ok(peer.pid);
+                for (let i = 0; i < 200 && !await healthOk(port); i++) await new Promise((r) => setTimeout(r, 10));
+                assert.equal(await healthOk(port), true, "real peer is serving the target port");
+                writeRegistryEntry({ instanceId: "superseding-peer", pid: peer.pid, port, origin: `http://127.0.0.1:${port}`, startedAt: Date.now(), lane: "dsh" });
+            },
             spawnImpl: makeSpawn(makeCrashStub("stub-superseded.mjs"), port, record),
             settleMs: 500, readyTimeoutMs: 3000,
             finish: () => { finished++; },
@@ -671,7 +676,7 @@ test("performSelfRestart: port taken over by another bili instance → parent ex
         assert.match(entries.join("\n"), /served by bili instance pid \d+ — exiting instead of resuming/s);
     } finally {
         record.child?.kill();
-        try { sleeper.kill("SIGKILL"); } catch {}
+        try { peer?.kill("SIGKILL"); } catch {}
         server.closeAllConnections?.();
         await new Promise<void>((r) => server.close(() => r()));
     }
@@ -720,5 +725,175 @@ test("performSelfRestart: a replacement that ignores SIGTERM is reaped by the SI
         server.closeAllConnections?.();
         await new Promise<void>((r) => server.close(() => r()));
     }
+    }
+});
+
+// Real socket/process regressions: absence of a foreign registry entry is
+// never proof that the replacement owns the released port.
+test("performSelfRestart: unrelated listeners and stale claims cannot establish readiness", { timeout: 30_000 }, async (t) => {
+    for (const mode of ["plain-http", "pid-less", "wrong-pid", "starting", "silent", "stale-own", "released-own", "stale-peer"] as const) {
+        await t.test(mode, async () => {
+            const { server, port } = await startServer();
+            const { log } = makeLog();
+            const record: SpawnRecord = {};
+            let finished = 0;
+            const stalePeer = mode === "stale-peer" ? spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }) : undefined;
+            let resumeError: Error | undefined;
+            server.on("error", (err) => { resumeError = err; });
+            const squatter = http.createServer((_req, res) => {
+                if (mode === "silent") return;
+                if (mode === "starting") res.statusCode = 503;
+                res.end(mode === "plain-http" ? "not bili" : JSON.stringify(
+                    mode === "starting" ? { ok: false, reason: "starting" }
+                    : mode === "pid-less" ? { ok: true }
+                    : { ok: true, pid: process.pid, instanceId: "unrelated" },
+                ));
+            });
+            const startedAt = Date.now();
+            try {
+                const result = await performSelfRestart({
+                    server, host: "127.0.0.1", port,
+                    installDir: makeInstall("1.0.1"), runningVersion: "1.0.0", diskVersion: "1.0.1",
+                    log, inFlightProvider: () => 0, settleMs: 500, readyTimeoutMs: 500, killVerifyMs: 200,
+                    preSpawnFlush: () => new Promise<void>((resolve, reject) => {
+                        squatter.once("error", reject);
+                        squatter.listen(port, "127.0.0.1", resolve);
+                    }),
+                    spawnImpl: () => {
+                        const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+                        record.child = child;
+                        assert.ok(child.pid);
+                        if (mode === "stale-own" || mode === "released-own") {
+                            writeRegistryEntry({ instanceId: mode, pid: child.pid, port,
+                                origin: `http://127.0.0.1:${port}`, startedAt: Date.now(),
+                                ...(mode === "released-own" ? { portReleasedAt: Date.now() } : {}) });
+                        }
+                        if (mode === "stale-peer") {
+                            // A live process's old registry claim is not proof
+                            // that this unrelated listener is serving as it.
+                            writeRegistryEntry({ instanceId: mode, pid: stalePeer!.pid, port,
+                                origin: `http://127.0.0.1:${port}`, startedAt: 1 });
+                        }
+                        return child;
+                    },
+                    finish: () => { finished++; },
+                });
+                assert.equal(result.ok, false, JSON.stringify(result));
+                assert.equal(result.error, "replacement-not-ready");
+                if (mode === "silent") assert.ok(Date.now() - startedAt < 8000, "silent HTTP cannot leave readiness polling unbounded");
+                assert.equal(finished, 0, "must not hand over to an unrelated listener");
+                assert.ok(record.child?.pid);
+                assert.equal(isPidAlive(record.child.pid), false, "failed replacement is reaped");
+                // Resume retains the normal EADDRINUSE policy; it must not
+                // claim a successful handover to avoid that error.
+                await new Promise((r) => setImmediate(r));
+                assert.equal((resumeError as NodeJS.ErrnoException | undefined)?.code, "EADDRINUSE");
+            } finally {
+                record.child?.kill("SIGKILL");
+                if (stalePeer && stalePeer.exitCode === null && stalePeer.signalCode === null) {
+                    const exited = once(stalePeer, "exit");
+                    stalePeer.kill("SIGKILL");
+                    await exited;
+                }
+                squatter.closeAllConnections();
+                await new Promise<void>((r) => squatter.close(() => r()));
+                server.closeAllConnections();
+                await new Promise<void>((r) => server.close(() => r()));
+            }
+        });
+    }
+});
+
+test("performSelfRestart: health identity supports registered, delayed, and pre-registry replacements", { timeout: 30_000 }, async (t) => {
+    for (const mode of ["unregistered", "registered", "starting", "stale-pid", "identity-mismatch"] as const) {
+        await t.test(mode, async () => {
+            const { server, port } = await startServer();
+            const { log } = makeLog();
+            const record: SpawnRecord = {};
+            let finished = 0;
+            const stub = path.join(root, `identity-${mode}.mjs`);
+            writeFileSync(stub, [
+                "import http from 'node:http';",
+                "import { mkdirSync, writeFileSync } from 'node:fs';",
+                `const mode = ${JSON.stringify(mode)};`,
+                "let probes = 0;",
+                "const server = http.createServer((req, res) => {",
+                "  if (req.url !== '/__bili/health') { res.end('ok'); return; }",
+                "  if (mode === 'starting' && probes++ === 0) { res.writeHead(503); res.end(JSON.stringify({ ok: false, reason: 'starting' })); return; }",
+                "  res.end(JSON.stringify({ ok: true, pid: process.pid, instanceId: 'identity-child' }));",
+                "});",
+                "server.listen(Number(process.argv[2]), '127.0.0.1', () => {",
+                "  if (mode === 'unregistered') return;",
+                `  mkdirSync(${JSON.stringify(instancesDir())}, { recursive: true });`,
+                `  writeFileSync(${JSON.stringify(path.join(instancesDir(), `identity-${mode}.json`))}, JSON.stringify({`,
+                "    instanceId: mode === 'identity-mismatch' ? 'different-instance' : 'identity-child', pid: process.pid,",
+                "    port: mode === 'stale-pid' ? Number(process.argv[2]) + 1 : Number(process.argv[2]),",
+                "    origin: 'http://127.0.0.1:' + process.argv[2], startedAt: mode === 'stale-pid' ? 1 : Date.now()",
+                "  }));",
+                "});",
+            ].join("\n"));
+            try {
+                const result = await performSelfRestart({
+                    server, host: "127.0.0.1", port,
+                    installDir: makeInstall("1.0.1"), runningVersion: "1.0.0", diskVersion: "1.0.1",
+                    log, inFlightProvider: () => 0, settleMs: 500, readyTimeoutMs: 1500, killVerifyMs: 200,
+                    spawnImpl: makeSpawn(stub, port, record), finish: () => { finished++; },
+                });
+                const expected = mode !== "identity-mismatch";
+                assert.equal(result.ok, expected, JSON.stringify(result));
+                assert.equal(finished, expected ? 1 : 0);
+                assert.ok(record.child?.pid);
+                assert.equal(isPidAlive(record.child.pid), expected);
+                if (expected) assert.equal(await requestOk(port), true);
+                else assert.equal(await waitForListening(server), true);
+            } finally {
+                const child = record.child;
+                if (child && child.exitCode === null && child.signalCode === null) {
+                    const exited = once(child, "exit");
+                    child.kill("SIGKILL");
+                    await exited;
+                }
+                server.closeAllConnections();
+                await new Promise<void>((r) => server.close(() => r()));
+            }
+        });
+    }
+});
+
+test("performSelfRestart: IPv6 wildcard handover probes the replacement over loopback", { timeout: 15_000 }, async (t) => {
+    const server = http.createServer((_req, res) => res.end("old"));
+    try {
+        await new Promise<void>((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(0, "::", resolve);
+        });
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL") { t.skip("IPv6 unavailable"); return; }
+        throw err;
+    }
+    const addr = server.address();
+    assert.ok(addr && typeof addr === "object");
+    const stub = path.join(root, "ipv6-ready.mjs");
+    writeFileSync(stub, "import http from 'node:http'; http.createServer((_req, res) => res.end(JSON.stringify({ok:true,pid:process.pid}))).listen(Number(process.argv[2]), '::1');");
+    const record: SpawnRecord = {};
+    let finished = 0;
+    try {
+        const result = await performSelfRestart({
+            server, host: "::", port: addr.port,
+            installDir: makeInstall("1.0.1"), runningVersion: "1.0.0", diskVersion: "1.0.1",
+            log: makeLog().log, inFlightProvider: () => 0, settleMs: 500, readyTimeoutMs: 3000,
+            spawnImpl: makeSpawn(stub, addr.port, record), finish: () => { finished++; },
+        });
+        assert.equal(result.ok, true, JSON.stringify(result));
+        assert.equal(finished, 1);
+    } finally {
+        const child = record.child;
+        if (child && child.exitCode === null && child.signalCode === null) {
+            const exited = once(child, "exit");
+            child.kill("SIGKILL");
+            await exited;
+        }
+        await new Promise<void>((r) => server.close(() => r()));
     }
 });

@@ -41,8 +41,8 @@
  * #3044 handover contract: the replacement is marked BILI_UPGRADE_REPLACEMENT
  * so it binds-or-dies on exactly the port freed here (no +1 ladder — hopping
  * stranded replacements serving no client while the prior instance kept the
- * real port). The parent verifies the child through its OWN registry record
- * (pid + actual bound port) rather than trusting a raw TCP answer on the port
+ * real port). The parent verifies the child through its health PID and
+ * corroborating registry identity rather than trusting a raw TCP answer on the port
  * (a racing host respawn could masquerade as the child), terminates any
  * misplaced or still-starting child and VERIFIES the kill, and exits instead
  * of resuming when another live bili instance has taken over the port
@@ -50,11 +50,11 @@
  * zombie half of the leak).
  */
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import net from "node:net";
 import path from "node:path";
 import type http from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { cacheDir } from "./paths.js";
+import { probeOwnerInfo } from "./port-owner.js";
 import { closeLogger, type Logger } from "./logger.js";
 import { flushAllSessions, totalInFlight } from "./session.js";
 import { flushConversations } from "./plugin.js";
@@ -142,18 +142,6 @@ export function probeHostFor(bindHost: string): string {
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function probeReady(host: string, port: number): Promise<boolean> {
-    return new Promise((resolve) => {
-        const socket = net.connect({ host, port });
-        const done = (ok: boolean) => {
-            socket.destroy();
-            resolve(ok);
-        };
-        socket.once("connect", () => done(true));
-        socket.once("error", () => done(false));
-    });
 }
 
 /** #2095: spawn options for the self-restart replacement, split by platform.
@@ -308,6 +296,7 @@ export async function performSelfRestart(deps: SelfRestartDeps): Promise<SelfRes
 
     log("info", `[restart] spawning replacement v${deps.diskVersion} on port ${port}...`);
     let child: ChildProcess;
+    const spawnedAt = Date.now();
     try {
         // Platform-split (#2095): win32 detaches so the replacement outlives our
         // exit (a non-detached child rides libuv's kill-on-job-close job object);
@@ -337,42 +326,47 @@ export async function performSelfRestart(deps: SelfRestartDeps): Promise<SelfRes
     });
     child.once("error", (err) => { exitReason = String(err); });
 
-    // Readiness signal ladder (#3044). The authoritative proof that the
-    // handover landed is the replacement's OWN registry record (its pid plus
-    // the port it ACTUALLY bound, written on announceListening). A raw TCP
-    // answer on our port can come from a racing peer (a host respawn during
-    // our drain window) — trusting it made us exit believing the upgrade had
-    // landed while the real replacement idled on a drifted port serving no
-    // client. The TCP probe remains as fallback only (pre-registry children,
-    // and children that have not announced yet).
+    // Registry markers are claims, not listener proof: a live process may
+    // have released its socket, or a dead marker's PID may have been reused.
+    // Require the target's health response to identify the spawned child.
+    // PID-bearing pre-registry children remain supported; raw TCP and legacy
+    // health responses without a PID cannot safely establish a handover.
     type HandoverOutcome =
         | { kind: "ready" }
         | { kind: "misplaced"; boundPort: number }
         | { kind: "superseded"; peerPid: number }
         | { kind: "not-ready"; exitReason?: string };
     const childPid = child.pid;
+    const probeHost = probeHostFor(host);
+    const origin = `http://${probeHost.includes(":") ? `[${probeHost}]` : probeHost}:${port}`;
+    const servingPeer = (info: Awaited<ReturnType<typeof probeOwnerInfo>>) =>
+        info?.pid === undefined ? undefined : listInstances().find((e) =>
+            e.port === port && e.pid === info.pid && e.pid !== childPid && e.pid !== process.pid
+            && e.instanceId === info.instanceId && e.portReleasedAt === undefined && isPidAlive(e.pid));
     const readyDeadline = Date.now() + readyTimeoutMs;
     let outcome: HandoverOutcome = { kind: "not-ready", exitReason };
     while (Date.now() < readyDeadline) {
         if (exitReason !== undefined) { outcome = { kind: "not-ready", exitReason }; break; }
-        const ownRecord = childPid !== undefined ? listInstances().find((e) => e.pid === childPid) : undefined;
-        if (ownRecord !== undefined) {
-            outcome = ownRecord.port === port
-                ? { kind: "ready" }
-                : { kind: "misplaced", boundPort: ownRecord.port };
+        const info = await probeOwnerInfo(origin, undefined, Math.max(1, Math.min(1500, readyDeadline - Date.now())));
+        // The child can exit while the HTTP probe is pending.
+        if (exitReason !== undefined || child.exitCode !== null || child.signalCode !== null) {
+            outcome = { kind: "not-ready", exitReason };
             break;
         }
-        if (await probeReady(probeHostFor(host), port)) {
-            // Our OWN registry record (written at our announceListening) still
-            // claims this port while we drain — without excluding process.pid a
-            // healthy not-yet-announced replacement reads as "superseded by us"
-            // and gets killed (pinned by the #2895 tunnel handover test).
-            const foreignPeer = listInstances().find((e) => e.port === port && e.pid !== childPid && e.pid !== process.pid && isPidAlive(e.pid));
-            if (foreignPeer !== undefined) {
-                outcome = { kind: "superseded", peerPid: foreignPeer.pid };
-            } else {
-                outcome = { kind: "ready" };
-            }
+        const ownRecord = childPid !== undefined ? listInstances().find((e) =>
+            e.pid === childPid && e.startedAt >= spawnedAt && e.portReleasedAt === undefined) : undefined;
+        if (ownRecord !== undefined && ownRecord.port !== port) {
+            outcome = { kind: "misplaced", boundPort: ownRecord.port };
+            break;
+        }
+        if (childPid !== undefined && info?.pid === childPid
+            && (ownRecord === undefined || info.instanceId === ownRecord.instanceId)) {
+            outcome = { kind: "ready" };
+            break;
+        }
+        const foreignPeer = servingPeer(info);
+        if (foreignPeer !== undefined) {
+            outcome = { kind: "superseded", peerPid: foreignPeer.pid };
             break;
         }
         await sleep(POLL_MS);
@@ -395,7 +389,7 @@ export async function performSelfRestart(deps: SelfRestartDeps): Promise<SelfRes
     // port nobody routes to — the zombie half of the reported leak. The
     // upgrade effectively landed elsewhere; exit cleanly instead. A foreign
     // non-bili squatter keeps today's resume behavior.
-    const biliPeer = listInstances().find((e) => e.port === port && e.pid !== process.pid && isPidAlive(e.pid));
+    const biliPeer = servingPeer(await probeOwnerInfo(origin));
     if (biliPeer !== undefined) {
         log("warn", `[restart] port ${port} is served by bili instance pid ${biliPeer.pid} — exiting instead of resuming (a resumed old-code copy would drift to a new port and leak, #3044)`);
         (deps.finish ?? defaultFinish)();
