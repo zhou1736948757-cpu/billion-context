@@ -65,16 +65,21 @@ const idsOf = (n: number, tag: string) => Array.from({ length: n }, (_, i) => ui
 
 /** Fake unified-store msg_id view: the test stands in for
  *  getStore().unifiedAllMessageIds(key) — full historical id set (#5312). */
-function fakeStore(): { rows: Map<string, string[]>; lookup: (k: string) => readonly string[] | null } {
+function fakeStore(): { rows: Map<string, string[]>; lookupKeys: string[]; lookup: (k: string) => readonly string[] | null } {
     const rows = new Map<string, string[]>();
-    return { rows, lookup: (k) => (rows.has(k) ? (rows.get(k) as string[]) : []) };
+    const lookupKeys: string[] = [];
+    return { rows, lookupKeys, lookup: (k) => {
+        lookupKeys.push(k);
+        return rows.has(k) ? (rows.get(k) as string[]) : [];
+    } };
 }
 
 /** The composite-field-failure history (4 cells, one surviving host id at
- *  position [2]). Reused by several pins with different id sets. */
+ *  position [2]). Keep this host summary free of bili identity markers so
+ *  the earlier self-checkpoint rung (#5734) cannot mask the msgid pins. */
 function incidentHistory(tag: string, survivor: string, filler: string): Msg[] {
     return [
-        { role: "user", content: `<bili-snapshot v1 conv="${tag}" seq="9" /> checkpoint condensing the prior exchange. ` + "z".repeat(120) },
+        { role: "user", content: `Native compaction summary for ${tag}: prior exchange condensed. ` + "z".repeat(120) },
         { role: "user", content: "continuation probe after the restart. " + "q".repeat(120) },
         { role: "assistant", content: "surviving cell, original slot 7. " + "w".repeat(120) },
         { role: "user", content: "the new live turn. " + filler },
@@ -114,6 +119,7 @@ test("#5719 T1: composite field failure + overlapping host ids re-anchor the raw
     assert.equal(res.action, "reanchor");
     assert.match(res.reason ?? "", /msgid identity \(#5719\)/);
     assert.match(res.reason ?? "", /1 host message id\(s\) match/);
+    assert.deepEqual(store.lookupKeys, [raw], "the msgid rung must query the raw lane exactly once");
 });
 
 test("#5719 T2: same composite failure but DISJOINT ids still forks (owner rule 3 guard rail)", () => {
@@ -131,6 +137,7 @@ test("#5719 T2: same composite failure but DISJOINT ids still forks (owner rule 
     const res = resolveSessionOrder(raw, stranger, SYSTEM_B, undefined, undefined, undefined, ["x-1", "x-2", "x-3", "x-4"], store.lookup);
     assert.equal(res.action, "derived-persona");
     assert.ok(res.key.startsWith(`${raw}|sub:`), res.key);
+    assert.deepEqual(store.lookupKeys, [raw], "disjoint ids still require one raw-lane lookup");
 });
 
 test("#5719 T3: no stamped ids → byte-for-byte the pre-change path (fork)", () => {
@@ -194,6 +201,8 @@ test("#5719 T5: stored rows outlive the wire — and NO JSON id ledger exists", 
     );
     assert.equal(late.key, raw, late.reason);
     assert.equal(late.action, "reanchor");
+    assert.match(late.reason ?? "", /msgid identity \(#5719\)/);
+    assert.deepEqual(store.lookupKeys, [raw], "stored historical ids must actually be consulted");
 
     // Single-source pin: identity evidence must NOT ride the session-order
     // skeletons (the deprecated JSON recording surface).
@@ -258,13 +267,16 @@ test("#5719 T7: personaConversationOrder forwards observer + ids + lazy lookup",
     assert.equal(seen.length, 1);
     assert.equal(seen[0].id, raw);
     assert.equal(seen[0].key, raw);
-    assert.ok(lookups <= 1, `lazy contract: store queried at most once (got ${lookups})`);
+    assert.equal(lookups, 1, "this fixture must exercise the lazy lookup exactly once");
+    assert.deepEqual(store.lookupKeys, [raw]);
+    assert.match(seen[0].reason ?? "", /msgid identity \(#5719\)/);
 });
 
 test("#5719 T8: store unavailable (lookup → null) degrades to byte evidence only → fork", () => {
     resetSessionOrderForTest();
     const raw = "session-5719-t8";
     assert.equal(resolveSessionOrder(raw, chain(10, "h"), SYSTEM_A).key, raw);
+    const lookupKeys: string[] = [];
     // Overlapping ids WOULD prove identity — but the unified store view is
     // null (latch-off / legacy epoch, #4407/#5536): degrade, never guess.
     const res = resolveSessionOrder(
@@ -275,8 +287,29 @@ test("#5719 T8: store unavailable (lookup → null) degrades to byte evidence on
         undefined,
         undefined,
         ["s-1", "s-2", uid("h", 3), "s-3"],
-        () => null,
+        (key) => { lookupKeys.push(key); return null; },
     );
     assert.equal(res.action, "derived-persona");
     assert.ok(res.key.startsWith(`${raw}|sub:`), res.key);
+    assert.deepEqual(lookupKeys, [raw], "the unavailable-store fallback must be exercised");
+});
+
+test("#5719 control: an explicit self-checkpoint bypasses the msgid lookup, including an unavailable store", () => {
+    for (const unavailable of [false, true]) {
+        resetSessionOrderForTest();
+        const raw = `session-5719-checkpoint-${unavailable}`;
+        assert.equal(resolveSessionOrder(raw, chain(10, "control"), SYSTEM_A).key, raw);
+        const history = incidentHistory(raw, uid("control", 7), "c".repeat(120));
+        history[0].content = `<bili-snapshot v1 conv="${raw}" seq="9" /> ` + history[0].content;
+        const lookupKeys: string[] = [];
+        const res = resolveSessionOrder(
+            raw, history, SYSTEM_B, undefined, undefined, undefined,
+            ["chk-control", "probe-control", uid("control", 7), "live-control"],
+            (key) => { lookupKeys.push(key); return unavailable ? null : idsOf(10, "control"); },
+        );
+        assert.equal(res.key, raw);
+        assert.equal(res.action, "reanchor");
+        assert.match(res.reason ?? "", /self-authored checkpoint declares this raw id/);
+        assert.deepEqual(lookupKeys, [], "checkpoint precedence must not depend on store availability");
+    }
 });
